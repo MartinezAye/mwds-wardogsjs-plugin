@@ -1,0 +1,16 @@
+{
+  "name": "mwds-wardogsjs-plugin",
+  "version": "0.1.0",
+  "description": "MyWardogsStats plugin for WardogsJS. Development only: the plugin ships as the single file mywardogsstats.js.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "check": "node --check mywardogsstats.js && node --check scripts/sign-release.mjs && node --check scripts/gen-keypair.mjs",
+    "sign": "node scripts/sign-release.mjs",
+    "keygen": "node scripts/gen-keypair.mjs"
+  }
+}
