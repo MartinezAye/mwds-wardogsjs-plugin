@@ -110,7 +110,7 @@ A build that still carries the placeholder key does not update at all.
 One time:
 
 1. `node scripts/gen-keypair.mjs <directory outside this repo>`. It refuses a path inside the repo and never overwrites.
-2. Paste the printed public key into `RELEASE_PUBLIC_KEY_PEM` in `mywardogsstats.js`, between the backticks, replacing `REPLACE_WITH_RELEASE_PUBLIC_KEY`.
+2. Paste the printed public key into `RELEASE_PUBLIC_KEY_PEM` in `mywardogsstats.js`, between the backticks. The shipped build already carries the maintainer key; only a fork replaces it.
 3. Store the private key offline. Never commit it, never give it to CI.
 
 Every release:

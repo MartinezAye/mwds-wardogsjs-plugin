@@ -97,7 +97,7 @@ test('a same-host redirect on raw.githubusercontent.com is followed', async () =
 });
 
 test('the placeholder key turns auto update off', async () => {
-  const ctx = makeUpdater(happyRoutes(), { publicKeyPem: mod.RELEASE_PUBLIC_KEY_PEM });
+  const ctx = makeUpdater(happyRoutes(), { publicKeyPem: 'REPLACE_WITH_RELEASE_PUBLIC_KEY' });
   assert.deepEqual(await ctx.updater.check(), { status: 'no_key' });
   assert.equal(ctx.calls.length, 0);
   assertUntouched(ctx);

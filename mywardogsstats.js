@@ -10,7 +10,9 @@ export const AGENT_NAME = 'mwds-wardogsjs-plugin';
 export const RELEASE_OWNER = 'MartinezAye';
 export const RELEASE_REPO = 'mwds-wardogsjs-plugin';
 export const RELEASE_FILE = 'mywardogsstats.js';
-export const RELEASE_PUBLIC_KEY_PEM = `REPLACE_WITH_RELEASE_PUBLIC_KEY`;
+export const RELEASE_PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAbs/b03Qw9LbQH4UYWrLGatPWRLRglxbq4dpWPBAvFDw=
+-----END PUBLIC KEY-----`;
 export const DEFAULT_ENDPOINT = 'https://api.mywardogsstats.com';
 export const DEFAULT_TOKEN_ENV = 'MWDS_FEED_TOKEN';
 
