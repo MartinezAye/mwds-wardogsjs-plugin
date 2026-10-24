@@ -40,6 +40,7 @@ Several servers in one process: give each its own token and env var, and set `fe
 | `sendSamples` | `true` | Post samples |
 | `forwardFeed` | `false` | Forward the event feed WardogsJS receives |
 | `autoUpdate` | `true` | Download signed releases |
+| `spoolMaxHours` | `24` | Hours of unsent data kept on disk, 0 to 72. `0` turns the outage queue off |
 
 ## What is sent
 
@@ -60,9 +61,9 @@ Several servers in one process: give each its own token and env var, and set `fe
 | Per post | at most 30 samples, body kept under 448 KB |
 | Per sample | at most 128 players, 8 faction rows; names cut to 64 characters |
 | `faction` | `null` when the player is unassigned: empty, `NONE`, `WHITE` or colour `#FFFFFF` |
-| Buffer | 15 minutes of samples (90). Oldest dropped first and counted |
+| Memory buffer | 15 minutes of samples (90). Overflow goes to the outage queue, or is dropped and counted when the queue is off or not allowed |
 
-**Feed forwarding** (`forwardFeed: true`), `POST <endpoint>/v1/ingest` in the game's own shape `{ serverId, serverName, events }`, same token. Use it when WardogsJS is already the game's feed endpoint, so the game does not need a second `EventFeedEndpoints` entry. One game batch becomes one post (split at 200 events). Event ids are kept, and an id is forwarded once. The queue holds 450 batches; oldest dropped first and counted.
+**Feed forwarding** (`forwardFeed: true`), `POST <endpoint>/v1/ingest` in the game's own shape `{ serverId, serverName, events }`, same token. Use it when WardogsJS is already the game's feed endpoint, so the game does not need a second `EventFeedEndpoints` entry. One game batch becomes one post (split at 200 events). Event ids are kept, and an id is forwarded once. The memory queue holds 450 batches; overflow goes to the outage queue.
 
 WardogsJS does not keep the raw feed body, so the plugin rebuilds events from the bus. Not carried over:
 
@@ -87,6 +88,25 @@ WardogsJS does not keep the raw feed body, so the plugin rebuilds events from th
 | anything else, timeout, network | exponential backoff from 5 s to 5 minutes, with jitter | unreachable |
 
 Requests time out after 10 s and never follow a redirect. Logs carry the status and the error code only, never the token or a response body.
+
+## Outage queue
+
+Unsent data is kept on disk so it survives ingest outages and WardogsJS restarts, like MySquadStats' `send-retry-requests.json`.
+
+| Item | Value |
+|---|---|
+| Location | `<WardogsJS root>/data/mywardogsstats/<server id>/`. WardogsJS has no plugin data folder of its own, so the plugin makes one. Add `data/` to the WardogsJS `.gitignore` if the install is a git checkout |
+| Files | `samples.jsonl` and `feed.jsonl` (one JSON line per sample or feed batch, append only), `samples.cursor.json` and `feed.cursor.json` (byte offset of the first unsent line, written atomically), `spool.json` (format version) |
+| Written when | a post fails with a network error, timeout, 404, 429, 503 or another 5xx; the memory buffer overflows; the plugin unmounts with data still in memory |
+| Not written when | the last answer was 401, 403 `server_suspended` or another 403: the existing queue is kept and new samples stay in the 15 minute memory window. 403 `server_not_approved`: nothing is written, data from before approval is not wanted |
+| Bounds | `spoolMaxHours` of data and 50 MB per file, whichever comes first. Oldest dropped first and counted. Feed batches age from when they were queued, samples from their `at` |
+| Compaction | once more than half the file has been sent, the unsent rest is rewritten to a new file and renamed over the old one |
+| Replay | oldest first, at start and after recovery. Live data goes first; the queue drains behind it at one post per second, 30 samples or up to 200 feed events of one boot per post. `retry-after` and the 10 minute backoffs hold it like any other post |
+| Dedupe | every sample keeps its own `at` (ingest dedupes on server and `at`), every feed event keeps its `eventId`. A crash between a post and the cursor write resends, never loses |
+| Safety | the token is never written. Every line is parsed as JSON and checked against the sample or feed shape on load and again before replay; anything else is dropped and counted, never evaluated. Files are `0600` and the folder `0700` where the OS supports it |
+| Upgrades | a release that changes the line format bumps `SPOOL_VERSION`; the first start on it discards the old queue and logs it once |
+
+A burst replay can meet the ingest event rate limit. The plugin then waits out `retry-after` and carries on.
 
 ## Updates
 

@@ -1,5 +1,17 @@
 import { createPublicKey, verify as verifyEd25519 } from 'node:crypto';
-import { promises as fsp } from 'node:fs';
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  mkdirSync,
+  openSync,
+  promises as fsp,
+  readFileSync,
+  readSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync
+} from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -27,7 +39,13 @@ export const LIMITS = Object.freeze({
   batchWindowMs: 30_000,
   bufferWindowMs: 15 * 60_000,
   bufferMaxSamples: 90,
-  pumpIntervalMs: 5_000,
+  pumpIntervalMs: 1_000,
+  replayIntervalMs: 1_000,
+  replayPeekEntries: 50,
+  spoolMaxBytes: 50 * 1024 * 1024,
+  spoolLineBytes: 1024 * 1024,
+  spoolDefaultHours: 24,
+  spoolMaxHours: 72,
   requestTimeoutMs: 10_000,
   authBackoffMs: 10 * 60_000,
   backoffBaseMs: 5_000,
@@ -325,7 +343,7 @@ async function errorCodeOf(response) {
 
 function failureReason(err) {
   if (err?.name === 'TimeoutError' || err?.name === 'AbortError') return 'timeout';
-  const code = err?.cause?.code;
+  const code = err?.cause?.code ?? err?.code;
   if (typeof code === 'string' && /^[A-Z0-9_]{2,40}$/.test(code)) return code;
   return typeof err?.name === 'string' && /^[A-Za-z]{2,40}$/.test(err.name) ? err.name : 'error';
 }
@@ -342,6 +360,395 @@ const STATE_MESSAGES = Object.freeze({
   failing: (detail) => `MyWardogsStats unreachable (${detail}), backing off`
 });
 
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function hasOnlyKeys(value, allowed) {
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
+function isText(value, max, min = 0) {
+  return typeof value === 'string' && value.length >= min && value.length <= max;
+}
+
+function isNullableText(value, max) {
+  return value === null || isText(value, max);
+}
+
+function isNullableNumber(value) {
+  return value === null || (typeof value === 'number' && Number.isFinite(value));
+}
+
+const SAMPLE_KEYS = new Set(['at', 'serverName', 'map', 'playersMax', 'factionScores', 'players']);
+const SCORE_KEYS = new Set(['name', 'colorHex', 'score']);
+const PLAYER_KEYS = new Set(['steamId', 'name', 'faction', 'kills', 'deaths', 'cash', 'pingMs']);
+const ENVELOPE_KEYS = new Set(['serverId', 'serverName', 'events']);
+const EVENT_TYPES = new Set(['killed', 'player_joined', 'player_left', 'match_state', 'match_ended']);
+const LINE_KEYS = new Set(['v', 't', 'd']);
+const HELD_STATES = new Set(['unauthorized', 'server_suspended', 'server_not_approved', 'forbidden']);
+const SAFE_SERVER_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+export const SPOOL_VERSION = 1;
+
+export function isValidSample(sample) {
+  if (!isPlainObject(sample) || !hasOnlyKeys(sample, SAMPLE_KEYS)) return false;
+  if (!isText(sample.at, 40, 1) || !Number.isFinite(Date.parse(sample.at))) return false;
+  if (!isNullableText(sample.serverName, 512) || !isNullableText(sample.map, 256)) return false;
+  if (!isNullableNumber(sample.playersMax)) return false;
+  if (!Array.isArray(sample.factionScores) || sample.factionScores.length > LIMITS.factionsPerSample) return false;
+  for (const row of sample.factionScores) {
+    if (!isPlainObject(row) || !hasOnlyKeys(row, SCORE_KEYS)) return false;
+    if (!isText(row.name, 256, 1) || !isNullableText(row.colorHex, 64) || !isNullableNumber(row.score)) return false;
+  }
+  if (!Array.isArray(sample.players) || sample.players.length > LIMITS.playersPerSample) return false;
+  for (const player of sample.players) {
+    if (!isPlainObject(player) || !hasOnlyKeys(player, PLAYER_KEYS)) return false;
+    if (!isText(player.steamId, 17) || !STEAM_ID.test(player.steamId)) return false;
+    if (!isText(player.name, 256) || !isNullableText(player.faction, 256)) return false;
+    for (const key of ['kills', 'deaths', 'cash', 'pingMs']) {
+      if (!isNullableNumber(player[key])) return false;
+    }
+  }
+  return true;
+}
+
+export function isValidEnvelope(envelope) {
+  if (!isPlainObject(envelope) || !hasOnlyKeys(envelope, ENVELOPE_KEYS)) return false;
+  if (envelope.serverId !== undefined && !isText(envelope.serverId, 128)) return false;
+  if (envelope.serverName !== undefined && !isText(envelope.serverName, 512)) return false;
+  if (!Array.isArray(envelope.events)) return false;
+  if (envelope.events.length === 0 || envelope.events.length > LIMITS.feedEventsPerPost) return false;
+  return envelope.events.every(
+    (event) => isPlainObject(event) && isText(event.eventId, 128, 1) && EVENT_TYPES.has(event.type)
+  );
+}
+
+const SPOOL_VALIDATORS = Object.freeze({ samples: isValidSample, feed: isValidEnvelope });
+
+let tempSequence = 0;
+
+function tempName(file) {
+  tempSequence += 1;
+  return `${file}.${process.pid}.${Date.now()}.${tempSequence}.tmp`;
+}
+
+function writeAtomic(file, data) {
+  const temp = tempName(file);
+  try {
+    writeFileSync(temp, data, { mode: 0o600, flag: 'wx' });
+    renameSync(temp, file);
+  } catch (err) {
+    try {
+      unlinkSync(temp);
+    } catch {}
+    throw err;
+  }
+}
+
+function restrict(file) {
+  try {
+    chmodSync(file, 0o600);
+  } catch {}
+}
+
+function removeIfPresent(file) {
+  try {
+    unlinkSync(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function parseSpoolLine(text, kind) {
+  if (text.length === 0 || text.length > LIMITS.spoolLineBytes) return null;
+  let line;
+  try {
+    line = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(line) || !hasOnlyKeys(line, LINE_KEYS)) return null;
+  if (line.v !== SPOOL_VERSION || typeof line.t !== 'number' || !Number.isFinite(line.t)) return null;
+  return SPOOL_VALIDATORS[kind](line.d) ? line : null;
+}
+
+export class Spool {
+  constructor({ dir, kind, maxAgeMs, maxBytes = LIMITS.spoolMaxBytes, now = () => Date.now() }) {
+    this.dir = dir;
+    this.kind = kind;
+    this.file = path.join(dir, `${kind}.jsonl`);
+    this.cursorFile = path.join(dir, `${kind}.cursor.json`);
+    this.maxAgeMs = maxAgeMs;
+    this.maxBytes = maxBytes;
+    this.now = now;
+    this.entries = [];
+    this.fileSize = 0;
+    this.cursor = 0;
+    this.stats = { written: 0, replayed: 0, dropped: 0, corrupt: 0 };
+  }
+
+  get length() {
+    return this.entries.length;
+  }
+
+  get pendingBytes() {
+    return this.fileSize - this.cursor;
+  }
+
+  readCursor(size, bytes) {
+    try {
+      const parsed = JSON.parse(readFileSync(this.cursorFile, 'utf8'));
+      const offset = parsed?.offset;
+      if (parsed?.v !== SPOOL_VERSION || !Number.isInteger(offset) || offset < 0 || offset > size) return 0;
+      if (offset > 0 && bytes[offset - 1] !== 0x0a) return 0;
+      return offset;
+    } catch {
+      return 0;
+    }
+  }
+
+  writeCursor() {
+    writeAtomic(this.cursorFile, JSON.stringify({ v: SPOOL_VERSION, offset: this.cursor }));
+  }
+
+  load() {
+    let bytes;
+    try {
+      bytes = readFileSync(this.file);
+    } catch {
+      bytes = null;
+    }
+    this.entries = [];
+    this.fileSize = 0;
+    this.cursor = 0;
+    if (!bytes || bytes.length === 0) {
+      removeIfPresent(this.cursorFile);
+      return this;
+    }
+    if (bytes.length > this.maxBytes * 4) {
+      this.stats.corrupt += 1;
+      removeIfPresent(this.file);
+      removeIfPresent(this.cursorFile);
+      return this;
+    }
+    const start = this.readCursor(bytes.length, bytes);
+    const kept = [];
+    let position = start;
+    while (position < bytes.length) {
+      const end = bytes.indexOf(0x0a, position);
+      if (end === -1) {
+        this.stats.corrupt += 1;
+        break;
+      }
+      const text = bytes.subarray(position, end).toString('utf8');
+      const line = parseSpoolLine(text, this.kind);
+      if (line) kept.push({ text, t: line.t });
+      else this.stats.corrupt += 1;
+      position = end + 1;
+    }
+    const clean = start === 0 && this.stats.corrupt === 0;
+    if (clean) {
+      let offset = 0;
+      for (const { text, t } of kept) {
+        const size = Buffer.byteLength(text) + 1;
+        this.entries.push({ offset, bytes: size, t });
+        offset += size;
+      }
+      this.fileSize = bytes.length;
+    } else {
+      this.rewrite(kept);
+    }
+    restrict(this.file);
+    this.enforceBounds();
+    return this;
+  }
+
+  rewrite(kept) {
+    const body = kept.map(({ text }) => `${text}\n`).join('');
+    const temp = tempName(this.file);
+    writeFileSync(temp, body, { mode: 0o600, flag: 'wx' });
+    this.cursor = 0;
+    this.writeCursor();
+    renameSync(temp, this.file);
+    this.entries = [];
+    let offset = 0;
+    for (const { text, t } of kept) {
+      const size = Buffer.byteLength(text) + 1;
+      this.entries.push({ offset, bytes: size, t });
+      offset += size;
+    }
+    this.fileSize = offset;
+  }
+
+  append(payload, t) {
+    if (!SPOOL_VALIDATORS[this.kind](payload)) {
+      this.stats.dropped += 1;
+      return false;
+    }
+    const text = JSON.stringify({ v: SPOOL_VERSION, t, d: payload });
+    if (text.length > LIMITS.spoolLineBytes) {
+      this.stats.dropped += 1;
+      return false;
+    }
+    const line = `${text}\n`;
+    const size = Buffer.byteLength(line);
+    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    const fresh = this.fileSize === 0;
+    appendFileSync(this.file, line, { mode: 0o600 });
+    if (fresh) restrict(this.file);
+    this.entries.push({ offset: this.fileSize, bytes: size, t });
+    this.fileSize += size;
+    this.stats.written += 1;
+    this.enforceBounds();
+    return true;
+  }
+
+  peek(count) {
+    const slice = this.entries.slice(0, count);
+    if (slice.length === 0) return [];
+    const from = slice[0].offset;
+    const last = slice[slice.length - 1];
+    const length = last.offset + last.bytes - from;
+    const buffer = Buffer.alloc(length);
+    const fd = openSync(this.file, 'r');
+    try {
+      readSync(fd, buffer, 0, length, from);
+    } finally {
+      closeSync(fd);
+    }
+    return slice.map((entry) => {
+      const text = buffer.subarray(entry.offset - from, entry.offset - from + entry.bytes - 1).toString('utf8');
+      return parseSpoolLine(text, this.kind)?.d ?? null;
+    });
+  }
+
+  ack(count, { dropped = false, corrupt = 0 } = {}) {
+    const removed = this.entries.splice(0, count).length;
+    if (removed === 0) return;
+    const good = removed - corrupt;
+    if (dropped) this.stats.dropped += good;
+    else this.stats.replayed += good;
+    this.stats.corrupt += corrupt;
+    this.cursor = this.entries[0]?.offset ?? this.fileSize;
+    this.settle();
+  }
+
+  enforceBounds() {
+    const cutoff = this.now() - this.maxAgeMs;
+    let dropped = 0;
+    while (this.entries.length > 0 && (this.entries[0].t < cutoff || this.pendingBytes > this.maxBytes)) {
+      const entry = this.entries.shift();
+      this.cursor = entry.offset + entry.bytes;
+      dropped += 1;
+    }
+    if (dropped === 0 && this.fileSize <= this.maxBytes) return 0;
+    this.stats.dropped += dropped;
+    this.settle();
+    return dropped;
+  }
+
+  settle() {
+    if (this.entries.length === 0) {
+      this.rewrite([]);
+      return;
+    }
+    if (this.cursor * 2 > this.fileSize || this.fileSize > this.maxBytes) {
+      this.compact();
+      return;
+    }
+    this.writeCursor();
+  }
+
+  compact() {
+    const from = this.cursor;
+    const length = this.fileSize - from;
+    const buffer = Buffer.alloc(length);
+    const fd = openSync(this.file, 'r');
+    try {
+      readSync(fd, buffer, 0, length, from);
+    } finally {
+      closeSync(fd);
+    }
+    const temp = tempName(this.file);
+    writeFileSync(temp, buffer, { mode: 0o600, flag: 'wx' });
+    this.cursor = 0;
+    this.writeCursor();
+    renameSync(temp, this.file);
+    for (const entry of this.entries) entry.offset -= from;
+    this.fileSize = length;
+  }
+}
+
+export function openSpools({ dir, maxAgeMs, maxBytes = LIMITS.spoolMaxBytes, now = () => Date.now(), log = () => {} }) {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const metaFile = path.join(dir, 'spool.json');
+  let version = null;
+  try {
+    version = JSON.parse(readFileSync(metaFile, 'utf8'))?.spoolVersion ?? null;
+  } catch {}
+  if (version !== SPOOL_VERSION) {
+    let removed = 0;
+    for (const kind of Object.keys(SPOOL_VALIDATORS)) {
+      if (removeIfPresent(path.join(dir, `${kind}.jsonl`))) removed += 1;
+      removeIfPresent(path.join(dir, `${kind}.cursor.json`));
+    }
+    if (removed > 0) log(`Outage queue format changed, discarded the old queue (format ${version ?? 'unknown'})`);
+    writeAtomic(metaFile, JSON.stringify({ spoolVersion: SPOOL_VERSION }));
+  }
+  return {
+    samples: new Spool({ dir, kind: 'samples', maxAgeMs, maxBytes, now }).load(),
+    feed: new Spool({ dir, kind: 'feed', maxAgeMs, maxBytes, now }).load()
+  };
+}
+
+export function samplesBatch(peeked) {
+  let count = peeked.length;
+  for (;;) {
+    const window = peeked.slice(0, count);
+    const valid = window.filter((sample) => sample !== null);
+    const corrupt = window.length - valid.length;
+    if (valid.length === 0) return { payload: null, count, corrupt };
+    const payload = buildSamplesBody(valid);
+    if (count <= 1 || Buffer.byteLength(JSON.stringify(payload)) <= LIMITS.maxBodyBytes) {
+      return { payload, count, corrupt };
+    }
+    count = Math.ceil(count / 2);
+  }
+}
+
+export function mergeEnvelopes(peeked) {
+  let leading = 0;
+  while (leading < peeked.length && peeked[leading] === null) leading += 1;
+  if (leading > 0 || peeked.length === 0) return { payload: null, count: leading, corrupt: leading };
+  const first = peeked[0];
+  const events = [...first.events];
+  let bytes = Buffer.byteLength(JSON.stringify(events));
+  let count = 1;
+  let corrupt = 0;
+  while (count < peeked.length) {
+    const next = peeked[count];
+    if (next === null) {
+      corrupt += 1;
+      count += 1;
+      continue;
+    }
+    if (next.serverId !== first.serverId || next.serverName !== first.serverName) break;
+    if (events.length + next.events.length > LIMITS.feedEventsPerPost) break;
+    const size = Buffer.byteLength(JSON.stringify(next.events));
+    if (bytes + size > LIMITS.maxBodyBytes) break;
+    events.push(...next.events);
+    bytes += size;
+    count += 1;
+  }
+  return {
+    payload: dropNulls({ serverId: first.serverId ?? null, serverName: first.serverName ?? null, events }),
+    count,
+    corrupt
+  };
+}
+
 export class IngestClient {
   constructor({
     endpoint,
@@ -350,7 +757,8 @@ export class IngestClient {
     now = () => Date.now(),
     random = Math.random,
     log = () => {},
-    onLatestVersion = () => {}
+    onLatestVersion = () => {},
+    spools = null
   }) {
     this.endpoint = endpoint;
     this.token = token;
@@ -359,6 +767,9 @@ export class IngestClient {
     this.random = random;
     this.log = (message) => log(redact(message, token));
     this.onLatestVersion = onLatestVersion;
+    this.spools = spools;
+    this.lastReplayAt = 0;
+    this.spoolFailed = false;
 
     this.samples = [];
     this.feed = [];
@@ -394,9 +805,50 @@ export class IngestClient {
       this.samples.length > 0 &&
       (this.samples.length > LIMITS.bufferMaxSamples || this.samples[0].queuedAt < oldest)
     ) {
-      this.samples.shift();
-      this.stats.samplesDropped += 1;
+      const entry = this.samples.shift();
+      if (!this.spoolSample(entry)) this.stats.samplesDropped += 1;
     }
+  }
+
+  canSpool() {
+    return this.spools !== null && !HELD_STATES.has(this.state);
+  }
+
+  spoolWrite(kind, payload, t) {
+    if (!this.canSpool()) return false;
+    try {
+      const written = this.spools[kind].append(payload, t);
+      this.spoolFailed = false;
+      return written;
+    } catch (err) {
+      if (!this.spoolFailed) this.log(`Outage queue write failed (${failureReason(err)}), data is kept in memory only`);
+      this.spoolFailed = true;
+      return false;
+    }
+  }
+
+  spoolSample(entry) {
+    const at = Date.parse(entry.sample.at);
+    return this.spoolWrite('samples', entry.sample, Number.isFinite(at) ? at : entry.queuedAt);
+  }
+
+  spoolEnvelope(envelope) {
+    return this.spoolWrite('feed', envelope, this.now());
+  }
+
+  spoolMemory() {
+    if (!this.canSpool()) return 0;
+    let moved = 0;
+    for (const envelope of this.feed) if (this.spoolEnvelope(envelope)) moved += 1;
+    for (const entry of this.samples) if (this.spoolSample(entry)) moved += 1;
+    this.feed = [];
+    this.samples = [];
+    return moved;
+  }
+
+  get spooled() {
+    if (!this.spools) return 0;
+    return this.spools.samples.length + this.spools.feed.length;
   }
 
   rememberForwarded(eventId) {
@@ -429,7 +881,8 @@ export class IngestClient {
       );
     }
     while (this.feed.length > LIMITS.feedQueueMaxEnvelopes) {
-      this.stats.feedEventsDropped += this.feed.shift().events.length;
+      const envelope = this.feed.shift();
+      if (!this.spoolEnvelope(envelope)) this.stats.feedEventsDropped += envelope.events.length;
     }
     return fresh.length;
   }
@@ -452,6 +905,10 @@ export class IngestClient {
     return this.busy;
   }
 
+  liveDue() {
+    return this.feed.length > 0 || this.samplesDue();
+  }
+
   async drain() {
     let backlog = false;
     for (;;) {
@@ -460,28 +917,53 @@ export class IngestClient {
       if (this.feed.length > 0) {
         const envelope = this.feed[0];
         const outcome = await this.post('/v1/ingest', envelope);
-        if (outcome === 'sent' || outcome === 'dropped') {
-          if (this.feed[0] === envelope) this.feed.shift();
-          if (outcome === 'sent') this.stats.feedEventsPosted += envelope.events.length;
-          else this.stats.feedEventsDropped += envelope.events.length;
-        }
+        const settled = outcome === 'sent' || outcome === 'dropped';
+        const spooled = outcome === 'retry' && this.feed[0] === envelope && this.spoolEnvelope(envelope);
+        if ((settled || spooled) && this.feed[0] === envelope) this.feed.shift();
+        if (outcome === 'sent') this.stats.feedEventsPosted += envelope.events.length;
+        if (outcome === 'dropped') this.stats.feedEventsDropped += envelope.events.length;
         if (outcome !== 'sent') return;
         continue;
       }
       if (this.samples.length > 0 && (backlog || this.samplesDue())) {
         const chunk = this.samplesChunk();
         const outcome = await this.post('/v1/ingest/samples', chunk.body, true);
-        if (outcome === 'sent' || outcome === 'dropped') {
-          const sent = new Set(chunk.entries);
-          this.samples = this.samples.filter((entry) => !sent.has(entry));
-          if (outcome === 'sent') this.stats.samplesPosted += chunk.entries.length;
-          else this.stats.samplesDropped += chunk.entries.length;
+        let release = outcome === 'sent' || outcome === 'dropped';
+        if (outcome === 'retry' && this.canSpool()) {
+          release = chunk.entries.every((entry) => this.spoolSample(entry));
         }
+        if (release) {
+          const done = new Set(chunk.entries);
+          this.samples = this.samples.filter((entry) => !done.has(entry));
+        }
+        if (outcome === 'sent') this.stats.samplesPosted += chunk.entries.length;
+        if (outcome === 'dropped') this.stats.samplesDropped += chunk.entries.length;
         if (outcome !== 'sent') return;
         backlog = true;
         continue;
       }
+      break;
+    }
+    await this.replay();
+  }
+
+  async replay() {
+    if (!this.spools || this.blocked() || this.liveDue()) return;
+    if (this.now() - this.lastReplayAt < LIMITS.replayIntervalMs) return;
+    const kind = this.spools.feed.length > 0 ? 'feed' : this.spools.samples.length > 0 ? 'samples' : null;
+    if (!kind) return;
+    this.lastReplayAt = this.now();
+    const spool = this.spools[kind];
+    const peeked = spool.peek(kind === 'feed' ? LIMITS.replayPeekEntries : LIMITS.samplesPerPost);
+    const batch = kind === 'feed' ? mergeEnvelopes(peeked) : samplesBatch(peeked);
+    if (batch.payload === null) {
+      spool.ack(batch.count, { dropped: true, corrupt: batch.corrupt });
       return;
+    }
+    const route = kind === 'feed' ? '/v1/ingest' : '/v1/ingest/samples';
+    const outcome = await this.post(route, batch.payload, kind === 'samples');
+    if (outcome === 'sent' || outcome === 'dropped') {
+      spool.ack(batch.count, { dropped: outcome === 'dropped', corrupt: batch.corrupt });
     }
   }
 
@@ -533,7 +1015,7 @@ export class IngestClient {
       });
     } catch (err) {
       this.failExponential('failing', failureReason(err));
-      return 'failed';
+      return 'retry';
     }
 
     const status = response.status;
@@ -551,33 +1033,33 @@ export class IngestClient {
       this.stats.failedPosts += 1;
       this.blockedUntil = this.now() + LIMITS.authBackoffMs;
       this.setState('unauthorized');
-      return 'failed';
+      return 'held';
     }
     if (status === 403) {
       this.stats.failedPosts += 1;
       this.blockedUntil = this.now() + LIMITS.authBackoffMs;
       if (code === 'server_not_approved' || code === 'server_suspended') this.setState(code);
       else this.setState('forbidden', code ?? 'no code');
-      return 'failed';
+      return 'held';
     }
     if (status === 429 || status === 503) {
       const wait = parseRetryAfter(response.headers.get('retry-after'), this.now());
       const state = status === 429 ? 'rate_limited' : 'overloaded';
       if (wait === null) {
         this.failExponential(state, 'a backoff');
-        return 'failed';
+        return 'retry';
       }
       this.stats.failedPosts += 1;
       this.blockedUntil = this.now() + wait;
       this.setState(state, `${Math.ceil(wait / 1000)}s`);
-      return 'failed';
+      return 'retry';
     }
     if (DROP_STATUSES.has(status)) {
       this.failExponential('rejected', `${status} ${code ?? 'no code'}`);
       return 'dropped';
     }
     this.failExponential('failing', `HTTP ${status}`);
-    return 'failed';
+    return 'retry';
   }
 
   async readLatestVersion(response) {
@@ -847,6 +1329,15 @@ export default class MyWardogsStats extends BasePlugin {
         default: true,
         label: 'Auto update',
         description: 'Download signed releases. A new version applies on the next restart.'
+      },
+      spoolMaxHours: {
+        required: false,
+        default: LIMITS.spoolDefaultHours,
+        type: 'number',
+        min: 0,
+        max: LIMITS.spoolMaxHours,
+        label: 'Outage queue hours',
+        description: 'Hours of unsent data kept on disk through outages and restarts, at most 50 MB per queue. 0 turns the queue off.'
       }
     };
   }
@@ -860,6 +1351,7 @@ export default class MyWardogsStats extends BasePlugin {
   feedServerId = null;
   feedServerName = null;
   lastVersionTrigger = null;
+  dataRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   now = () => Date.now();
   fetchImpl = (...args) => globalThis.fetch(...args);
   random = Math.random;
@@ -893,8 +1385,44 @@ export default class MyWardogsStats extends BasePlugin {
       now: () => this.now(),
       random: () => this.random(),
       log: (message) => this.verbose(1, message),
-      onLatestVersion: (version) => this.onLatestVersion(version)
+      onLatestVersion: (version) => this.onLatestVersion(version),
+      spools: this.openOutageQueue()
     });
+  }
+
+  get spoolHours() {
+    const hours = Number(this.options.spoolMaxHours);
+    if (!Number.isFinite(hours) || hours < 0 || hours > LIMITS.spoolMaxHours) return LIMITS.spoolDefaultHours;
+    return hours;
+  }
+
+  get spoolDir() {
+    return path.join(this.dataRoot, 'data', 'mywardogsstats', String(this.server.id));
+  }
+
+  openOutageQueue() {
+    const hours = this.spoolHours;
+    if (hours === 0) return null;
+    if (!SAFE_SERVER_ID.test(String(this.server.id))) {
+      this.verbose(1, 'Server id is not usable as a folder name, the outage queue is off');
+      return null;
+    }
+    try {
+      const spools = openSpools({
+        dir: this.spoolDir,
+        maxAgeMs: hours * 3_600_000,
+        now: () => this.now(),
+        log: (message) => this.verbose(1, message)
+      });
+      const pending = spools.samples.length + spools.feed.length;
+      if (pending > 0) this.verbose(1, `Outage queue holds ${spools.samples.length} sample(s) and ${spools.feed.length} feed batch(es) to replay`);
+      const corrupt = spools.samples.stats.corrupt + spools.feed.stats.corrupt;
+      if (corrupt > 0) this.verbose(1, `Outage queue dropped ${corrupt} unreadable line(s)`);
+      return spools;
+    } catch (err) {
+      this.verbose(1, `Outage queue unavailable (${failureReason(err)}), data is kept in memory only`);
+      return null;
+    }
   }
 
   async mount() {
@@ -933,6 +1461,7 @@ export default class MyWardogsStats extends BasePlugin {
     this.timers = [];
     this.removeAllTrackedListeners();
     this.closeFeedEnvelope();
+    this.client?.spoolMemory();
   }
 
   every(ms, task) {

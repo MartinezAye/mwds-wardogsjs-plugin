@@ -117,11 +117,22 @@ export async function startStub() {
   };
 }
 
-export async function makePlugin({ server = makeServer(), options = {}, clock = makeClock(), random = () => 1 } = {}) {
+export function makeDataRoot() {
+  return mkdtempSync(path.join(os.tmpdir(), 'mwds-data-'));
+}
+
+export async function makePlugin({
+  server = makeServer(),
+  options = {},
+  clock = makeClock(),
+  random = () => 1,
+  dataRoot = makeDataRoot()
+} = {}) {
   const { mod } = await loadPlugin();
-  const plugin = new mod.default(server, { autoUpdate: false, ...options }, {});
+  const plugin = new mod.default(server, { autoUpdate: false, spoolMaxHours: 0, ...options }, {});
   plugin.now = clock.now;
   plugin.random = random;
+  plugin.dataRoot = dataRoot;
   await plugin.prepareToMount();
   return { plugin, server, clock, mod };
 }

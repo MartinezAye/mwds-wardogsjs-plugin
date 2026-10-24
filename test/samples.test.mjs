@@ -11,12 +11,13 @@ test('option spec follows WardogsJS conventions', () => {
   assert.equal(Plugin.defaultEnabled, false);
   assert.equal(typeof Plugin.description, 'string');
   const spec = Plugin.optionsSpecification;
-  assert.deepEqual(Object.keys(spec), ['endpoint', 'feedTokenEnv', 'sendSamples', 'forwardFeed', 'autoUpdate']);
+  assert.deepEqual(Object.keys(spec), ['endpoint', 'feedTokenEnv', 'sendSamples', 'forwardFeed', 'autoUpdate', 'spoolMaxHours']);
   assert.equal(spec.endpoint.default, 'https://ingest.mywardogsstats.com');
   assert.equal(spec.feedTokenEnv.perServer, true);
   assert.equal(spec.sendSamples.default, true);
   assert.equal(spec.forwardFeed.default, false);
   assert.equal(spec.autoUpdate.default, true);
+  assert.deepEqual([spec.spoolMaxHours.default, spec.spoolMaxHours.min, spec.spoolMaxHours.max], [24, 0, 72]);
   assert.equal(spec.endpoint.validate('https://ingest.mywardogsstats.com/'), 'https://ingest.mywardogsstats.com');
 });
 

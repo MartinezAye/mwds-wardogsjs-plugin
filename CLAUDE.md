@@ -19,7 +19,7 @@ test/                      node:test suites, harness, stub BasePlugin under test
 2. One file, no dependencies: Node built-ins, global `fetch`, and `../src/plugins/base-plugin.js` from WardogsJS. No other WardogsJS imports.
 3. WardogsJS is read only. Never edit it. Read state from `server.status`, `server.players` and bus events; never poll RCON, never mutate framework state.
 4. Option spec follows WardogsJS `src/plugins/option-spec.js`: `enabled` is the entry flag, secrets are referenced by an `*Env` key (`feedTokenEnv`, locked, per server).
-5. The token is never logged. Every client log line goes through `redact`. Logs carry HTTP status and a known error code only, never a response body.
+5. The token is never logged and never written to disk. Every client log line goes through `redact`. Logs carry HTTP status and a known error code only, never a response body.
 6. Ingest requests: 10 s timeout, `redirect: "error"`. Update downloads: https, `raw.githubusercontent.com` only, manual redirects within that host, 512 KB cap.
 7. Never commit a private key. `RELEASE_PUBLIC_KEY_PEM` is the placeholder until the maintainer pastes the real public key.
 8. Bump `PLUGIN_VERSION` and `package.json` together. The updater refuses a file whose `PLUGIN_VERSION` differs from the tag.
@@ -35,4 +35,6 @@ test/                      node:test suites, harness, stub BasePlugin under test
 - `FEED_BATCH` fires only for batches with kills, so `serverId` for a kill-free batch is the last one seen.
 - WardogsJS dedupes feed ids over 5000 events; the plugin dedupes forwarded ids over 5000 more; ingest dedupes on `eventId`.
 - Backend error bodies are `{ error: { code } }`. Codes: `../mwds-backend/src/api/errors.ts`.
-- No persisted state. The squadstats `update-cleared.json` is not used: it exists to wipe on-disk retry queues after an update, and this plugin keeps its queues in memory.
+- Outage queue: `<WardogsJS root>/data/mywardogsstats/<server id>/`, JSONL per kind plus an atomic cursor. WardogsJS has no plugin data dir convention; plugins store in MySQL. Spool I/O is synchronous on purpose: one writer per file, small appends, ordering is trivially correct.
+- Bump `SPOOL_VERSION` whenever the line format or the sample or envelope shape changes. The first start on the new version discards the old queue: the squadstats "update cleared" idea.
+- Post outcomes: `sent`, `dropped` (400, 413, 415, 422), `held` (401, 403, never spooled), `retry` (everything else, spooled).
