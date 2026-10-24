@@ -12,12 +12,12 @@ test('option spec follows WardogsJS conventions', () => {
   assert.equal(typeof Plugin.description, 'string');
   const spec = Plugin.optionsSpecification;
   assert.deepEqual(Object.keys(spec), ['endpoint', 'feedTokenEnv', 'sendSamples', 'forwardFeed', 'autoUpdate']);
-  assert.equal(spec.endpoint.default, 'https://api.mywardogsstats.com');
+  assert.equal(spec.endpoint.default, 'https://ingest.mywardogsstats.com');
   assert.equal(spec.feedTokenEnv.perServer, true);
   assert.equal(spec.sendSamples.default, true);
   assert.equal(spec.forwardFeed.default, false);
   assert.equal(spec.autoUpdate.default, true);
-  assert.equal(spec.endpoint.validate('https://api.mywardogsstats.com/'), 'https://api.mywardogsstats.com');
+  assert.equal(spec.endpoint.validate('https://ingest.mywardogsstats.com/'), 'https://ingest.mywardogsstats.com');
 });
 
 test('endpoint validation allows https and loopback http only', () => {
@@ -26,7 +26,7 @@ test('endpoint validation allows https and loopback http only', () => {
   assert.equal(validateEndpoint('http://localhost:4000/'), 'http://localhost:4000');
   assert.equal(validateEndpoint('https://ingest.example.com/base/'), 'https://ingest.example.com/base');
   for (const bad of [
-    'http://api.mywardogsstats.com',
+    'http://ingest.mywardogsstats.com',
     'http://127.0.0.2',
     'ftp://example.com',
     'https://user:pass@example.com',

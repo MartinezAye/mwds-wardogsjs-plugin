@@ -18,7 +18,7 @@ One file, `mywardogsstats.js`, that sends your server's player, faction and scor
    {
      "plugin": "MyWardogsStats",
      "enabled": true,
-     "endpoint": "https://api.mywardogsstats.com",
+     "endpoint": "https://ingest.mywardogsstats.com",
      "feedTokenEnv": "MWDS_FEED_TOKEN",
      "sendSamples": true,
      "forwardFeed": false,
@@ -35,7 +35,7 @@ Several servers in one process: give each its own token and env var, and set `fe
 | Option | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | The WardogsJS plugin entry flag |
-| `endpoint` | `https://api.mywardogsstats.com` | Ingest origin. https only; `http://127.0.0.1` and `http://localhost` allowed for local testing |
+| `endpoint` | `https://ingest.mywardogsstats.com` | Ingest origin. https only; `http://127.0.0.1` and `http://localhost` allowed for local testing |
 | `feedTokenEnv` | `MWDS_FEED_TOKEN` | Name of the `.env` variable holding the token. The token itself never goes in `config.json` and is never logged. Locked: the website editor cannot change it |
 | `sendSamples` | `true` | Post samples |
 | `forwardFeed` | `false` | Forward the event feed WardogsJS receives |

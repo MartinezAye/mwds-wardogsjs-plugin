@@ -13,7 +13,7 @@ export const RELEASE_FILE = 'mywardogsstats.js';
 export const RELEASE_PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAbs/b03Qw9LbQH4UYWrLGatPWRLRglxbq4dpWPBAvFDw=
 -----END PUBLIC KEY-----`;
-export const DEFAULT_ENDPOINT = 'https://api.mywardogsstats.com';
+export const DEFAULT_ENDPOINT = 'https://ingest.mywardogsstats.com';
 export const DEFAULT_TOKEN_ENV = 'MWDS_FEED_TOKEN';
 
 export const LIMITS = Object.freeze({
