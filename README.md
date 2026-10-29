@@ -12,7 +12,7 @@ One file, `mywardogsstats.js`, that sends your server's player, faction and scor
    MWDS_FEED_TOKEN=<token from the owner portal>
    ```
 
-4. Add the plugin to `config/config.json` under `plugins` (a WardogsJS start also adds it, disabled, with these defaults):
+4. Add the plugin to `config/config.json` under `plugins` (a WardogsJS start also adds it, disabled, with these defaults). This is the single `server` shape; a config with a `servers` array uses [Several servers](#several-servers) instead:
 
    ```json
    {
@@ -28,7 +28,49 @@ One file, `mywardogsstats.js`, that sends your server's player, faction and scor
 
 5. Restart WardogsJS.
 
-Several servers in one process: give each its own token and env var, and set `feedTokenEnv` per server (it is a per-server key, see WardogsJS `docs/MULTI-SERVER.md`).
+## Several servers
+
+Each game server needs its own token from the owner portal, in its own env var:
+
+```
+MWDS_FEED_TOKEN_1=<token for server 1>
+MWDS_FEED_TOKEN_2=<token for server 2>
+```
+
+A config with a `servers` array runs every plugin from one root entry. Put the plugin in root `plugins` with a `servers` list of the server ids it runs on, in place of `enabled`. Then set `feedTokenEnv` inside each server entry's `plugins`. It is the only per-server key; everything else is shared from the root entry.
+
+```json
+{
+  "plugins": [
+    {
+      "plugin": "MyWardogsStats",
+      "servers": [1, 2],
+      "endpoint": "https://ingest.mywardogsstats.com",
+      "sendSamples": true,
+      "forwardFeed": false,
+      "autoUpdate": true
+    }
+  ],
+  "servers": [
+    {
+      "id": 1,
+      "name": "Server 1",
+      "rcon": { "...": "..." },
+      "plugins": [ { "plugin": "MyWardogsStats", "feedTokenEnv": "MWDS_FEED_TOKEN_1" } ]
+    },
+    {
+      "id": 2,
+      "name": "Server 2",
+      "rcon": { "...": "..." },
+      "plugins": [ { "plugin": "MyWardogsStats", "feedTokenEnv": "MWDS_FEED_TOKEN_2" } ]
+    }
+  ]
+}
+```
+
+Keep the existing `rcon`, `events` and `feed` blocks of each server as they are; only the `plugins` line is added. A server left out of the root `servers` list does not run the plugin. A server in the list without its own `feedTokenEnv` uses the root value, `MWDS_FEED_TOKEN` by default, so two servers would share one token. Give every server its own. Each server keeps its own outage queue under `data/mywardogsstats/<server id>/`.
+
+Older configs that still use `enabled` and per-server `plugins` entries are moved to this shape on the next WardogsJS start, with a `config.json.pre-global.bak` copy. See WardogsJS `docs/MULTI-SERVER.md`.
 
 ## Options
 
